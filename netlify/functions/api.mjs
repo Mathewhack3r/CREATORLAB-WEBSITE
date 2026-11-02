@@ -331,4 +331,119 @@ async function actionSaveProduct(request) {
   if (title.length < 3 || !description || !validCategories.includes(category)) fail(400, 'Enter a title, description and one of the listed categories.');
   if (!Number.isSafeInteger(price) || price < 0 || !Number.isSafeInteger(originalPrice) || originalPrice < 0) fail(400, 'Prices must be whole amounts in Nigerian Naira.');
   if (discountEnabled && (price <= 0 || originalPrice <= price)) fail(400, 'For a discount, the original price must be higher than the current price.');
-  if ((input.tutorialUrl && !tutorialUrl) || (input.deliveryLink && !deliveryLink)) fail(400, 'Links mus
+  if ((input.tutorialUrl && !tutorialUrl) || (input.deliveryLink && !deliveryLink)) fail(400, 'Links must use a valid http:// or https:// address.');
+  const image = form.get('image');
+  const file = form.get('file');
+  let imageKeyValue = existing?.imageKey || '';
+  let fileKeyValue = existing?.fileKey || '';
+  let fileName = existing?.fileName || '';
+  let fileMime = existing?.fileMime || '';
+  if (image && typeof image.arrayBuffer === 'function' && image.size > 0) {
+    if (image.size > MAX_IMAGE_BYTES) fail(413, 'Cover images must be 1.5 MB or smaller.');
+    const mime = image.type.toLowerCase();
+    if (!['image/jpeg','image/png','image/webp'].includes(mime)) fail(400, 'Cover images must be JPG, PNG or WebP.');
+    const bytes = Buffer.from(await image.arrayBuffer());
+    if (!checkImage(bytes, mime)) fail(400, 'That image file could not be validated. Please choose a JPG, PNG or WebP image.');
+    imageKeyValue = imageKey(id);
+    await filesStore().set(imageKeyValue, new Blob([bytes], { type: mime }), { metadata: { type: mime, filename: safeFilename(image.name), size: bytes.length } });
+  }
+  if (file && typeof file.arrayBuffer === 'function' && file.size > 0) {
+    if (file.size > MAX_FILE_BYTES) fail(413, 'Resource files must be 4 MB or smaller.');
+    const mime = file.type.toLowerCase();
+    if (!['application/pdf','text/plain','application/zip','application/x-zip-compressed'].includes(mime)) fail(400, 'Resource files must be PDF, TXT or ZIP.');
+    const bytes = Buffer.from(await file.arrayBuffer());
+    if (!checkResourceFile(bytes, mime)) fail(400, 'That file could not be validated. Please upload a valid PDF, TXT or ZIP file.');
+    fileKeyValue = fileKey(id);
+    fileName = safeFilename(file.name);
+    fileMime = mime;
+    await filesStore().set(fileKeyValue, new Blob([bytes], { type: mime }), { metadata: { type: mime, filename: fileName, size: bytes.length } });
+  }
+  if (published && !fileKeyValue && !deliveryLink) fail(400, 'Add a private download file or a Telegram delivery link before publishing.');
+  const now = new Date().toISOString();
+  const product = {
+    id, title, category, description, preview, price, originalPrice,
+    discountEnabled: discountEnabled && price > 0, featured, published, tutorialUrl, deliveryLink,
+    whatIncluded: validateArray(input.whatIncluded), howToUse: validateArray(input.howToUse),
+    imageKey: imageKeyValue, fileKey: fileKeyValue, fileName, fileMime,
+    sales: Number(existing?.sales || 0), createdAt: existing?.createdAt || now, updatedAt: now
+  };
+  await productsStore().set(productKey(id), JSON.stringify(product));
+  const allProducts = await listAllProducts();
+  return json({ saved: true, product: adminProduct(product), products: allProducts.map(adminProduct) });
+}
+async function actionDeleteProduct(request) {
+  checkSameOrigin(request);
+  await currentAdmin();
+  const input = await parseJson(request);
+  const id = cleanText(input.id, 80);
+  const product = await loadProduct(id);
+  if (!product) fail(404, 'Resource not found.');
+  await productsStore().delete(productKey(id));
+  if (product.imageKey) await filesStore().delete(product.imageKey);
+  if (product.fileKey) await filesStore().delete(product.fileKey);
+  return json({ deleted: true, products: (await listAllProducts()).map(adminProduct) });
+}
+async function actionSettingsSave(request) {
+  checkSameOrigin(request);
+  await currentAdmin();
+  const input = await parseJson(request);
+  const allowed = {};
+  for (const key of ['telegramCommunity','telegramChannel','whatsapp','instagram','youtube']) {
+    const raw = cleanText(input[key], 700);
+    const safe = safeUrl(raw);
+    if (raw && !safe) fail(400, `${key} must be a valid http:// or https:// link.`);
+    allowed[key] = safe;
+  }
+  const supportEmail = cleanText(input.supportEmail, 254).toLowerCase();
+  if (supportEmail && !safeEmail(supportEmail)) fail(400, 'Enter a valid support email address.');
+  allowed.supportEmail = supportEmail;
+  await writeSettings(allowed);
+  return json({ settings: allowed });
+}
+async function actionWebhook(request) {
+  const secret = process.env.PAYSTACK_SECRET_KEY;
+  if (!secret) fail(503, 'Payments are not configured.');
+  const signature = request.headers.get('x-paystack-signature') || '';
+  const raw = await request.text();
+  const expected = createHmac('sha512', secret).update(raw).digest('hex');
+  const a = Buffer.from(signature, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  if (a.length !== b.length || !timingSafeEqual(a, b)) fail(401, 'Webhook signature is invalid.');
+  let event;
+  try { event = JSON.parse(raw); } catch { fail(400, 'Webhook body is not valid JSON.'); }
+  if (event.event !== 'charge.success' || !event.data?.reference) return json({ received: true, processed: false });
+  const reference = cleanText(event.data.reference, 100);
+  if (!/^[a-zA-Z0-9.=-]{8,100}$/.test(reference)) fail(400, 'Webhook reference is invalid.');
+  const order = await ordersStore().get(orderKey(reference), { type: 'json' });
+  if (!order) return json({ received: true, processed: false });
+  if (order.status === 'paid') return json({ received: true, processed: true, duplicate: true });
+  const verifiedData = await verifyAgainstPaystack(reference, order);
+  await upsertPaidOrder(reference, verifiedData);
+  return json({ received: true, processed: true });
+}
+
+export default async function handler(request) {
+  try {
+    const url = new URL(request.url);
+    const action = url.searchParams.get('action') || 'products';
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'Allow': 'GET, POST, OPTIONS' } });
+    if (action === 'webhook' && request.method === 'POST') return await actionWebhook(request);
+    if (action === 'products' && request.method === 'GET') return await actionProducts();
+    if (action === 'settings-public' && request.method === 'GET') return json({ settings: await readSettings() });
+    if (action === 'image' && request.method === 'GET') return await actionImage(url);
+    if (action === 'download' && request.method === 'GET') return await actionDownload(request, url);
+    if (action === 'start' && request.method === 'POST') return await actionStart(request);
+    if (action === 'verify' && request.method === 'POST') return await actionVerify(request);
+    if (action === 'free-access' && request.method === 'POST') return await actionFreeAccess(request);
+    if (action === 'admin-data' && request.method === 'GET') return await actionAdminData();
+    if (action === 'save-product' && request.method === 'POST') return await actionSaveProduct(request);
+    if (action === 'delete-product' && request.method === 'POST') return await actionDeleteProduct(request);
+    if (action === 'settings-save' && request.method === 'POST') return await actionSettingsSave(request);
+    fail(404, 'Unknown request.');
+  } catch (error) {
+    const status = Number(error.status) || 500;
+    if (status >= 500) console.error('CreatorLab API error:', error?.message || error);
+    const message = status >= 500 ? 'The service is temporarily unavailable. Please try again in a moment.' : error.message;
+    return json({ error: message }, status);
+  }
+      }
