@@ -1,0 +1,13 @@
+{
+  "name": "creatorlab-ai-resource-store",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^11.1.7",
+    "@netlify/identity": "^2.0.0"
+  }
+}
